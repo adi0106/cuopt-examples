@@ -18,12 +18,14 @@ general:
     logging:
       console:
         _type: console
-        level: WARN
-    tracing:
-      phoenix:
-        _type: phoenix
-        endpoint: http://phoenix:6006/v1/traces
-        project: cuopt-agent
+        # Set via DEBUG_LEVEL on the container (0=WARN, 1=DEBUG). See entrypoint.sh.
+        level: ${LOG_LEVEL:-WARN}
+    # tracing:
+      # Phoenix tracing disabled.
+      # phoenix:
+      #   _type: phoenix
+      #   endpoint: http://phoenix:6006/v1/traces
+      #   project: cuopt-agent
       # Uncomment to use LangSmith for tracing with your own LangSmith account.
       # langsmith:
       #   _type: langsmith

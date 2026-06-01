@@ -22,7 +22,6 @@
 #   docker compose -f deploy/compose/docker-compose.yml run --rm cuopt-agent-eval
 #
 # Open the UI at http://localhost:3000
-# Open Phoenix tracing at http://localhost:6006
 
 x-agent-common: &agent-common
   build:
@@ -30,6 +29,10 @@ x-agent-common: &agent-common
     dockerfile: cuopt_agent/docker/Dockerfile
   image: cuopt-agent:latest
   env_file: ../../.env
+  environment:
+    # 0 = quiet (WARNING only), 1 = full logs (INFO + DEBUG). Default on so
+    # container logs are useful out of the box; set DEBUG_LEVEL=0 to silence.
+    DEBUG_LEVEL: ${DEBUG_LEVEL:-1}
   deploy:
     resources:
       reservations:
@@ -37,9 +40,6 @@ x-agent-common: &agent-common
           - driver: nvidia
             count: 1
             capabilities: [gpu]
-  depends_on:
-    phoenix:
-      condition: service_started
 
 services:
   cuopt-agent:
@@ -47,6 +47,8 @@ services:
     container_name: cuopt-agent
     ports:
       - "8000:8000"
+    volumes:
+      - ../../config:/config:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -60,14 +62,6 @@ services:
     profiles:
       - eval
     command: nat eval --config_file /app/cuopt_agent/configs/config-deepagent-eval.yml
-
-  phoenix:
-    image: arizephoenix/phoenix:latest
-    container_name: cuopt-phoenix
-    ports:
-      - "6006:6006"
-      - "4317:4317"
-    restart: unless-stopped
 
   nat-ui:
     build:

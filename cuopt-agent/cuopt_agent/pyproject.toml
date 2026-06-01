@@ -38,7 +38,7 @@ classifiers = ["Programming Language :: Python"]
 # cuopt-cu12 pin must match the container base image (Dockerfile.dev FROM line).
 # In-container: already satisfied, pip/uv skips it.  Local: pulled from pypi.nvidia.com.
 dependencies = [
-  "nvidia-nat[eval,langchain,phoenix]~=1.5.0",
+  "nvidia-nat[eval,langchain,phoenix]~=1.6.0",
   "deepagents",
   "psutil",
   "sqlalchemy[asyncio]",

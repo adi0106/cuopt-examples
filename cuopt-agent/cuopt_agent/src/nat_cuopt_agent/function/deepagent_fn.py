@@ -56,6 +56,31 @@ _DEFAULT_STRIP_REASONING_PATTERN = (
 # Streaming tuning (not NAT workflow YAML keys — adjust here, not in config-deepagent.yml).
 _STREAM_MAX_SEGMENT_CHARS = 48
 _STREAM_PROGRESS_UPDATES = True
+_TOOL_INPUT_PREVIEW_CHARS = 200
+_TOOL_OUTPUT_PREVIEW_CHARS = 300
+
+
+def _truncate_oneline(s: str, n: int) -> str:
+    s = s.replace("\n", " ")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _format_tool_input(inp: object) -> str:
+    if inp is None:
+        return ""
+    try:
+        s = json.dumps(inp, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        s = str(inp)
+    return _truncate_oneline(s, _TOOL_INPUT_PREVIEW_CHARS)
+
+
+def _format_tool_output(out: object) -> str:
+    if out is None:
+        return ""
+    if hasattr(out, "content"):
+        out = out.content
+    return _truncate_oneline(str(out), _TOOL_OUTPUT_PREVIEW_CHARS)
 
 
 def _split_partial_marker_suffix(text: str, marker: str) -> tuple[str, str]:
@@ -178,6 +203,16 @@ class _StreamSegmentEmitter:
             segments.extend(self._push_piece(kind, piece))
         return segments
 
+    def feed_kind(self, kind: _StreamKind, text: str) -> list[tuple[_StreamKind, str]]:
+        """Push *text* directly into *kind*'s buffer, bypassing the thinking-tag parser.
+
+        Use for text whose channel is already known (e.g. tool-event markers, the
+        ``additional_kwargs.reasoning_content`` field from minimax-style chunks).
+        """
+        if not text:
+            return []
+        return self._push_piece(kind, text)
+
     def finish(self) -> list[tuple[_StreamKind, str]]:
         segments: list[tuple[_StreamKind, str]] = []
         for kind, piece in self._parser.flush():
@@ -238,7 +273,11 @@ def _catalog_stream_chunk(
 
 
 class _StreamDeltaWriter:
-    """Map segmented stream pieces to API Catalog ``ChatResponseChunk`` objects."""
+    """Map segmented stream pieces to API Catalog ``ChatResponseChunk`` objects.
+
+    Emits delta-only content/reasoning in each chunk (every chunk carries only
+    the new segment since the previous chunk), so clients render by appending.
+    """
 
     def __init__(
         self,
@@ -255,6 +294,9 @@ class _StreamDeltaWriter:
 
     def feed(self, text: str) -> list[ChatResponseChunk]:
         return [self._to_chunk(kind, segment) for kind, segment in self._emitter.feed(text)]
+
+    def feed_kind(self, kind: _StreamKind, text: str) -> list[ChatResponseChunk]:
+        return [self._to_chunk(k, segment) for k, segment in self._emitter.feed_kind(kind, text)]
 
     def finish(self) -> list[ChatResponseChunk]:
         return [self._to_chunk(kind, segment) for kind, segment in self._emitter.finish()]
@@ -371,6 +413,8 @@ class DeepAgentConfig(FunctionBaseConfig, name="deepagent_fn"):
             "Set to empty string to disable stripping."
         ),
     )
+
+
 @register_function(config_type=DeepAgentConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
 async def deep_agent(config: DeepAgentConfig, builder: Builder):
     import psutil
@@ -536,7 +580,8 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
         return any(isinstance(s, str) and s.startswith("tools:") for s in ns)
 
     def _message_token_text(token: object) -> str:
-        if getattr(token, "type", None) not in ("ai", None):
+        # AIMessage.type == "ai"; AIMessageChunk.type == "AIMessageChunk" — accept both.
+        if getattr(token, "type", None) not in ("ai", "AIMessageChunk", None):
             return ""
         if getattr(token, "tool_call_chunks", None):
             return ""
@@ -555,27 +600,54 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
             return None
         return None
 
-    async def _stream_llm_chunks(agent: object, messages: list) -> AsyncGenerator[str, None]:
-        """Yield main-agent assistant text (LLM tokens and optional progress lines)."""
+    async def _stream_llm_chunks(
+        agent: object, messages: list
+    ) -> AsyncGenerator[tuple[_StreamKind, str], None]:
+        """Yield (kind, text) tuples for the main-agent stream.
 
-        async def _yield_from_astream_events() -> AsyncGenerator[str, None]:
+        kind="content"   -> user-facing answer tokens (delta.content)
+        kind="reasoning" -> minimax reasoning_content trace + tool start/end markers
+        """
+
+        async def _yield_from_astream_events() -> AsyncGenerator[tuple[_StreamKind, str], None]:
             astream_events = getattr(agent, "astream_events", None)
             if astream_events is None:
                 return
             async for event in astream_events({"messages": messages}, version="v2"):
-                if not isinstance(event, dict) or event.get("event") != "on_chat_model_stream":
+                if not isinstance(event, dict):
                     continue
-                data = event.get("data") or {}
-                llm_chunk = data.get("chunk")
-                text = _message_token_text(llm_chunk)
-                if text:
-                    yield text
+                etype = event.get("event")
+
+                if etype == "on_chat_model_stream":
+                    data = event.get("data") or {}
+                    llm_chunk = data.get("chunk")
+                    if llm_chunk is None:
+                        continue
+                    text = _message_token_text(llm_chunk)
+                    if text:
+                        yield "content", text
+                    ak = getattr(llm_chunk, "additional_kwargs", None) or {}
+                    rc = ak.get("reasoning_content")
+                    if rc:
+                        yield "reasoning", rc
+
+                elif etype == "on_tool_start":
+                    name = event.get("name") or "tool"
+                    inp = _format_tool_input((event.get("data") or {}).get("input"))
+                    suffix = f" {inp}" if inp else ""
+                    yield "reasoning", f"\n\n**[{name}]**{suffix}\n"
+
+                elif etype == "on_tool_end":
+                    name = event.get("name") or "tool"
+                    out = _format_tool_output((event.get("data") or {}).get("output"))
+                    suffix = f" → {out}" if out else ""
+                    yield "reasoning", f"**[{name} done]**{suffix}\n"
 
         emitted = False
         try:
-            async for text in _yield_from_astream_events():
+            async for item in _yield_from_astream_events():
                 emitted = True
-                yield text
+                yield item
         except Exception:
             logger.debug("astream_events token stream unavailable", exc_info=True)
 
@@ -611,7 +683,7 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
                     continue
                 progress = _progress_from_update(chunk)
                 if progress:
-                    yield progress
+                    yield "reasoning", progress
                 continue
 
             if chunk_type != "messages":
@@ -624,7 +696,7 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
             token = payload[0]
             text = _message_token_text(token)
             if text:
-                yield text
+                yield "content", text
 
     async def _stream(chat_request_or_message: ChatRequestOrMessage) -> AsyncGenerator[ChatResponseChunk, None]:
         """OpenAI-style SSE chunks via NAT ``ChatResponseChunk`` (``data:`` lines when framed by NAT)."""
@@ -649,10 +721,14 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
                 role=UserMessageContentRoleType.ASSISTANT,
             )
             try:
-                async for text in _stream_llm_chunks(agent, messages):
-                    assembled_raw.append(text)
-                    for chunk in writer.feed(text):
-                        yield chunk
+                async for kind, text in _stream_llm_chunks(agent, messages):
+                    if kind == "content":
+                        assembled_raw.append(text)
+                        for chunk in writer.feed(text):
+                            yield chunk
+                    else:
+                        for chunk in writer.feed_kind("reasoning", text):
+                            yield chunk
             except Exception:
                 logger.exception("Token streaming failed; falling back to buffered completion")
                 agent_result = await agent.ainvoke({"messages": messages})

@@ -18,12 +18,14 @@ general:
     logging:
       console:
         _type: console
-        level: WARN
-    tracing:
-      phoenix:
-        _type: phoenix
-        endpoint: http://phoenix:6006/v1/traces
-        project: cuopt-agent
+        # Set via DEBUG_LEVEL on the container (0=WARN, 1=DEBUG). See entrypoint.sh.
+        level: ${LOG_LEVEL:-WARN}
+    # tracing:
+      # Phoenix tracing disabled.
+      # phoenix:
+      #   _type: phoenix
+      #   endpoint: http://phoenix:6006/v1/traces
+      #   project: cuopt-agent
       # Uncomment to use LangSmith for tracing with your own LangSmith account.
       # langsmith:
       #   _type: langsmith
@@ -36,7 +38,7 @@ general:
     # Workflow/tool traces remain available via Phoenix tracing. Use step_adaptor mode custom/default
     # only for interactive UIs that consume intermediate_data.
     step_adaptor:
-      mode: off
+      mode: 'off'
     endpoints:
       - path: /health
         method: GET
@@ -46,7 +48,7 @@ general:
 llms:
   cuopt_llm:
     _type: nim
-    model: minimaxai/minimax-m2.5
+    model: minimaxai/minimax-m2.7
     api_key: ${NVIDIA_API_KEY}
     base_url: https://integrate.api.nvidia.com/v1/
     max_tokens: 16384
