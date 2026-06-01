@@ -543,6 +543,7 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
 
     async def _single(chat_request_or_message: ChatRequestOrMessage) -> ChatResponse:
         """Non-streaming OpenAI chat completion (root JSON object, no ``value`` wrapper)."""
+        logging.info("In _single: Received chat request: %s", chat_request_or_message)
         chat_request = GlobalTypeConverter.get().convert(chat_request_or_message, to_type=ChatRequest)
         async with _agent_session(chat_request) as (agent, messages):
             agent_result = await agent.ainvoke({"messages": messages})
@@ -701,6 +702,7 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
     async def _stream(chat_request_or_message: ChatRequestOrMessage) -> AsyncGenerator[ChatResponseChunk, None]:
         """OpenAI-style SSE chunks via NAT ``ChatResponseChunk`` (``data:`` lines when framed by NAT)."""
         chat_request = GlobalTypeConverter.get().convert(chat_request_or_message, to_type=ChatRequest)
+        logging.info("In _stream: Received chat request: %s", chat_request_or_message)
         response_model = _response_model(chat_request)
         stream_id = str(uuid.uuid4())
         created = datetime.datetime.now(datetime.UTC)
