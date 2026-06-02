@@ -86,4 +86,45 @@ function transform(r, data, flags) {
     r.sendBuffer(out, flags);
 }
 
-export default { transform };
+// Body-aware routing for POST /generate.
+//
+// nginx selects the streaming upstream (/generate/stream, SSE) vs the
+// non-streaming one (/generate, JSON). The request-body `stream` flag is
+// AUTHORITATIVE: an explicit `"stream": true|false` always wins. The Accept
+// header is only a fallback for clients that omit the flag entirely.
+//
+// Why the body wins over Accept: NVCF STREAMING-type functions
+// (`--function-type STREAMING`) send `Accept: text/event-stream` to the
+// container on *every* invocation, so Accept-based routing would stream
+// unconditionally. The body, by contrast, is forwarded verbatim and reflects
+// the caller's actual intent (matching the OpenAI `stream` convention).
+//
+// Reads the body via r.requestText (requires `client_body_in_single_buffer on`
+// and a body that fits in client_body_buffer_size; otherwise requestText is
+// empty and routing falls back to the Accept header). Sets $generate_uri and
+// internally redirects to the /__generate_proxy location that does proxy_pass.
+function route(r) {
+    var wantStream = false;
+    var decided = false;
+
+    var body = r.requestText;   // empty if no body or spilled to temp file
+    if (body) {
+        try {
+            var parsed = JSON.parse(body);
+            if (typeof parsed.stream === "boolean") {
+                wantStream = parsed.stream;   // explicit flag is authoritative
+                decided = true;
+            }
+        } catch (e) { /* not JSON: fall through to Accept-header routing */ }
+    }
+
+    if (!decided) {
+        var accept = r.headersIn["Accept"] || "";
+        if (/text\/event-stream/i.test(accept)) wantStream = true;
+    }
+
+    r.variables.generate_uri = wantStream ? "/generate/stream" : "/generate";
+    r.internalRedirect("/__generate_proxy");
+}
+
+export default { transform, route };
