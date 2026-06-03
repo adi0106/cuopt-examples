@@ -39,6 +39,7 @@ classifiers = ["Programming Language :: Python"]
 # In-container: already satisfied, pip/uv skips it.  Local: pulled from pypi.nvidia.com.
 dependencies = [
   "nvidia-nat[eval,langchain,phoenix]~=1.6.0",
+  "langchain-nvidia-ai-endpoints>=1.4.1,<2.0.0",
   "deepagents",
   "psutil",
   "sqlalchemy[asyncio]",
