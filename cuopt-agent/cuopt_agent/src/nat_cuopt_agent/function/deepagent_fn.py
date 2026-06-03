@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import datetime
 import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
@@ -56,6 +58,7 @@ _DEFAULT_STRIP_REASONING_PATTERN = (
 # Streaming tuning (not NAT workflow YAML keys — adjust here, not in config-deepagent.yml).
 _STREAM_MAX_SEGMENT_CHARS = 48
 _STREAM_PROGRESS_UPDATES = True
+_STREAM_IDLE_LOG_SECONDS = 10.0
 _TOOL_INPUT_PREVIEW_CHARS = 200
 _TOOL_OUTPUT_PREVIEW_CHARS = 300
 
@@ -81,6 +84,74 @@ def _format_tool_output(out: object) -> str:
     if hasattr(out, "content"):
         out = out.content
     return _truncate_oneline(str(out), _TOOL_OUTPUT_PREVIEW_CHARS)
+
+
+def _safe_obj_attr(obj: object, name: str) -> object:
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return None
+    if callable(value):
+        return None
+    return value
+
+
+def _safe_llm_summary(llm: object) -> dict[str, object]:
+    attrs = {
+        name: _safe_obj_attr(llm, name)
+        for name in ("model", "model_name", "model_id", "base_url", "api_base", "server_url")
+    }
+    return {
+        "type": f"{type(llm).__module__}.{type(llm).__name__}",
+        **{k: v for k, v in attrs.items() if v not in (None, "")},
+    }
+
+
+def _drop_unsupported_chatnvidia_model_kwargs(llm: object) -> None:
+    model_kwargs = _safe_obj_attr(llm, "model_kwargs")
+    if not isinstance(model_kwargs, dict):
+        return
+    if "verify_ssl" in model_kwargs:
+        model_kwargs.pop("verify_ssl", None)
+        logger.info("Removed unsupported ChatNVIDIA model kwarg: verify_ssl")
+
+
+def _event_trace_summary(event: dict) -> dict[str, object]:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    return {
+        "event": event.get("event"),
+        "name": event.get("name"),
+        "run_id": event.get("run_id"),
+        "data_keys": sorted(data.keys()),
+        "metadata_keys": sorted(metadata.keys()),
+    }
+
+
+async def _next_with_idle_logs(
+    iterator: AsyncIterator,
+    *,
+    request_id: str,
+    label: str,
+    started: float,
+    detail_fn,
+) -> object:
+    pending = asyncio.create_task(anext(iterator))
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=_STREAM_IDLE_LOG_SECONDS)
+            if done:
+                return await pending
+            logger.warning(
+                "[%s] _stream_llm_chunks: still waiting for %s next item at %.3fs%s",
+                request_id,
+                label,
+                time.monotonic() - started,
+                f" ({detail_fn()})" if detail_fn else "",
+            )
+    except asyncio.CancelledError:
+        pending.cancel()
+        raise
 
 
 def _split_partial_marker_suffix(text: str, marker: str) -> tuple[str, str]:
@@ -421,7 +492,7 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
     from deepagents import create_deep_agent
     from deepagents.backends.local_shell import LocalShellBackend
     from deepagents.middleware.memory import MemoryMiddleware
-    from langchain.agents.middleware.model_retry import ModelRetryMiddleware
+    from langchain.agents.middleware.model_retry import ModelRetryMiddleware, calculate_delay, should_retry_exception
 
     from .utils import (
         SANDBOX_AGENTS_MD,
@@ -451,6 +522,95 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
 
     # Instantiate LLM with NAT builder
     llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
+    _drop_unsupported_chatnvidia_model_kwargs(llm)
+    logger.info("Resolved LLM: %s", _safe_llm_summary(llm))
+
+    class LoggingModelRetryMiddleware(ModelRetryMiddleware):
+        def _log_retry_failure(
+            self,
+            *,
+            attempt: int,
+            exc: Exception,
+            retry: bool,
+            delay: float | None,
+            async_call: bool,
+        ) -> None:
+            logger.warning(
+                "Model retry failure async=%s attempt=%d/%d retry=%s delay=%s exc_type=%s exc=%s",
+                async_call,
+                attempt,
+                self.max_retries + 1,
+                retry,
+                f"{delay:.3f}" if delay is not None else None,
+                type(exc).__name__,
+                _truncate_oneline(str(exc), 600),
+            )
+
+        def wrap_model_call(self, request, handler):
+            for attempt in range(self.max_retries + 1):
+                try:
+                    return handler(request)
+                except Exception as exc:
+                    attempts_made = attempt + 1
+                    retry = should_retry_exception(exc, self.retry_on)
+                    if not retry:
+                        self._log_retry_failure(
+                            attempt=attempts_made, exc=exc, retry=False, delay=None, async_call=False
+                        )
+                        return self._handle_failure(exc, attempts_made)
+                    if attempt < self.max_retries:
+                        delay = calculate_delay(
+                            attempt,
+                            backoff_factor=self.backoff_factor,
+                            initial_delay=self.initial_delay,
+                            max_delay=self.max_delay,
+                            jitter=self.jitter,
+                        )
+                        self._log_retry_failure(
+                            attempt=attempts_made, exc=exc, retry=True, delay=delay, async_call=False
+                        )
+                        if delay > 0:
+                            time.sleep(delay)
+                    else:
+                        self._log_retry_failure(
+                            attempt=attempts_made, exc=exc, retry=False, delay=None, async_call=False
+                        )
+                        return self._handle_failure(exc, attempts_made)
+            msg = "Unexpected: retry loop completed without returning"
+            raise RuntimeError(msg)
+
+        async def awrap_model_call(self, request, handler):
+            for attempt in range(self.max_retries + 1):
+                try:
+                    return await handler(request)
+                except Exception as exc:
+                    attempts_made = attempt + 1
+                    retry = should_retry_exception(exc, self.retry_on)
+                    if not retry:
+                        self._log_retry_failure(
+                            attempt=attempts_made, exc=exc, retry=False, delay=None, async_call=True
+                        )
+                        return self._handle_failure(exc, attempts_made)
+                    if attempt < self.max_retries:
+                        delay = calculate_delay(
+                            attempt,
+                            backoff_factor=self.backoff_factor,
+                            initial_delay=self.initial_delay,
+                            max_delay=self.max_delay,
+                            jitter=self.jitter,
+                        )
+                        self._log_retry_failure(
+                            attempt=attempts_made, exc=exc, retry=True, delay=delay, async_call=True
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                    else:
+                        self._log_retry_failure(
+                            attempt=attempts_made, exc=exc, retry=False, delay=None, async_call=True
+                        )
+                        return self._handle_failure(exc, attempts_made)
+            msg = "Unexpected: retry loop completed without returning"
+            raise RuntimeError(msg)
 
     # Resolve venv path if provided for use in sandbox
     env: dict[str, str] = {}
@@ -498,7 +658,7 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
             middleware = [
                 FixToolNamesMiddleware(),
                 ToolRetryMiddleware(),
-                ModelRetryMiddleware(
+                LoggingModelRetryMiddleware(
                     max_retries=config.max_retries,
                     backoff_factor=config.retry_backoff_factor,
                     initial_delay=config.retry_initial_delay,
@@ -543,14 +703,48 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
 
     async def _single(chat_request_or_message: ChatRequestOrMessage) -> ChatResponse:
         """Non-streaming OpenAI chat completion (root JSON object, no ``value`` wrapper)."""
-        logging.info("In _single: Received chat request: %s", chat_request_or_message)
+        request_id = uuid.uuid4().hex[:8]
+        started = time.monotonic()
+        logging.info("[%s] _single received chat request: %s", request_id, chat_request_or_message)
         chat_request = GlobalTypeConverter.get().convert(chat_request_or_message, to_type=ChatRequest)
+        logging.info(
+            "[%s] _single converted request: model=%s messages=%d max_tokens=%s",
+            request_id,
+            _response_model(chat_request),
+            len(chat_request.messages),
+            chat_request.max_tokens,
+        )
         async with _agent_session(chat_request) as (agent, messages):
-            agent_result = await agent.ainvoke({"messages": messages})
-            result_messages = agent_result["messages"]
-            content = result_messages[-1].content if result_messages else ""
+            logging.info("[%s] _single agent session ready at %.3fs", request_id, time.monotonic() - started)
+            # The DeepAgents buffered `ainvoke` path can hang while the token
+            # streaming path completes. For non-streaming API clients, consume
+            # the same stream internally and return the assembled content.
+            assembled: list[str] = []
+            chunk_count = 0
+            async for kind, text in _stream_llm_chunks(agent, messages, request_id=request_id):
+                chunk_count += 1
+                if kind == "content":
+                    assembled.append(text)
+                if chunk_count <= 5:
+                    logging.info(
+                        "[%s] _single consumed stream chunk %d kind=%s chars=%d at %.3fs",
+                        request_id,
+                        chunk_count,
+                        kind,
+                        len(text),
+                        time.monotonic() - started,
+                    )
+            content = "".join(assembled)
             content = strip_pattern(content, strip_re)
+            logging.info(
+                "[%s] _single assembled content_chars=%d stream_chunks=%d at %.3fs",
+                request_id,
+                len(content),
+                chunk_count,
+                time.monotonic() - started,
+            )
         usage = _usage_for_content(chat_request, content)
+        logging.info("[%s] _single returning response at %.3fs", request_id, time.monotonic() - started)
         return ChatResponse.from_string(content, usage=usage, model=_response_model(chat_request))
 
     def _extract_text_content(content: object) -> str:
@@ -602,22 +796,68 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
         return None
 
     async def _stream_llm_chunks(
-        agent: object, messages: list
+        agent: object, messages: list, request_id: str
     ) -> AsyncGenerator[tuple[_StreamKind, str], None]:
         """Yield (kind, text) tuples for the main-agent stream.
 
         kind="content"   -> user-facing answer tokens (delta.content)
         kind="reasoning" -> minimax reasoning_content trace + tool start/end markers
         """
+        started = time.monotonic()
 
         async def _yield_from_astream_events() -> AsyncGenerator[tuple[_StreamKind, str], None]:
             astream_events = getattr(agent, "astream_events", None)
             if astream_events is None:
+                logger.info("[%s] _stream_llm_chunks: agent has no astream_events", request_id)
                 return
-            async for event in astream_events({"messages": messages}, version="v2"):
+            logger.info("[%s] _stream_llm_chunks: entering astream_events", request_id)
+            event_count = 0
+            emitted_count = 0
+            last_event_type = "none"
+            event_iter = astream_events({"messages": messages}, version="v2").__aiter__()
+            while True:
+                try:
+                    event = await _next_with_idle_logs(
+                        event_iter,
+                        request_id=request_id,
+                        label="astream_events",
+                        started=started,
+                        detail_fn=lambda: (
+                            f"events={event_count} emitted={emitted_count} last_event={last_event_type}"
+                        ),
+                    )
+                except StopAsyncIteration:
+                    break
                 if not isinstance(event, dict):
                     continue
+                event_count += 1
                 etype = event.get("event")
+                last_event_type = str(etype)
+                if event_count <= 5 or event_count % 50 == 0:
+                    logger.info(
+                        "[%s] _stream_llm_chunks: astream_events event=%s count=%d at %.3fs",
+                        request_id,
+                        etype,
+                        event_count,
+                        time.monotonic() - started,
+                    )
+                if etype in (
+                    "on_chat_model_start",
+                    "on_chat_model_stream",
+                    "on_chat_model_end",
+                    "on_chat_model_error",
+                    "on_llm_start",
+                    "on_llm_stream",
+                    "on_llm_end",
+                    "on_llm_error",
+                ):
+                    logger.info(
+                        "[%s] _stream_llm_chunks: model event summary=%s count=%d at %.3fs",
+                        request_id,
+                        _event_trace_summary(event),
+                        event_count,
+                        time.monotonic() - started,
+                    )
 
                 if etype == "on_chat_model_stream":
                     data = event.get("data") or {}
@@ -626,23 +866,48 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
                         continue
                     text = _message_token_text(llm_chunk)
                     if text:
+                        emitted_count += 1
+                        if emitted_count <= 5:
+                            logger.info(
+                                "[%s] _stream_llm_chunks: emitting content chars=%d via astream_events at %.3fs",
+                                request_id,
+                                len(text),
+                                time.monotonic() - started,
+                            )
                         yield "content", text
                     ak = getattr(llm_chunk, "additional_kwargs", None) or {}
                     rc = ak.get("reasoning_content")
                     if rc:
+                        emitted_count += 1
+                        if emitted_count <= 5:
+                            logger.info(
+                                "[%s] _stream_llm_chunks: emitting reasoning chars=%d via astream_events at %.3fs",
+                                request_id,
+                                len(rc),
+                                time.monotonic() - started,
+                            )
                         yield "reasoning", rc
 
                 elif etype == "on_tool_start":
                     name = event.get("name") or "tool"
                     inp = _format_tool_input((event.get("data") or {}).get("input"))
                     suffix = f" {inp}" if inp else ""
+                    logger.info("[%s] _stream_llm_chunks: tool_start name=%s", request_id, name)
                     yield "reasoning", f"\n\n**[{name}]**{suffix}\n"
 
                 elif etype == "on_tool_end":
                     name = event.get("name") or "tool"
                     out = _format_tool_output((event.get("data") or {}).get("output"))
                     suffix = f" → {out}" if out else ""
+                    logger.info("[%s] _stream_llm_chunks: tool_end name=%s", request_id, name)
                     yield "reasoning", f"**[{name} done]**{suffix}\n"
+            logger.info(
+                "[%s] _stream_llm_chunks: astream_events completed events=%d emitted=%d at %.3fs",
+                request_id,
+                event_count,
+                emitted_count,
+                time.monotonic() - started,
+            )
 
         emitted = False
         try:
@@ -650,15 +915,22 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
                 emitted = True
                 yield item
         except Exception:
-            logger.debug("astream_events token stream unavailable", exc_info=True)
+            logger.warning(
+                "[%s] _stream_llm_chunks: astream_events unavailable after %.3fs",
+                request_id,
+                time.monotonic() - started,
+                exc_info=True,
+            )
 
         if emitted:
+            logger.info("[%s] _stream_llm_chunks: used astream_events path at %.3fs", request_id, time.monotonic() - started)
             return
 
         stream_modes: list[str] = ["messages"]
         if _STREAM_PROGRESS_UPDATES:
             stream_modes.append("updates")
 
+        logger.info("[%s] _stream_llm_chunks: entering fallback astream modes=%s", request_id, stream_modes)
         try:
             astream = agent.astream(
                 {"messages": messages},
@@ -667,23 +939,52 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
                 version="v2",
             )
         except TypeError:
+            logger.info("[%s] _stream_llm_chunks: fallback astream does not accept version", request_id)
             astream = agent.astream(
                 {"messages": messages},
                 stream_mode="messages",
                 subgraphs=True,
             )
 
-        async for chunk in astream:
+        fallback_count = 0
+        fallback_emitted = 0
+        last_fallback_type = "none"
+        fallback_iter = astream.__aiter__()
+        while True:
+            try:
+                chunk = await _next_with_idle_logs(
+                    fallback_iter,
+                    request_id=request_id,
+                    label="fallback astream",
+                    started=started,
+                    detail_fn=lambda: (
+                        f"chunks={fallback_count} emitted={fallback_emitted} last_type={last_fallback_type}"
+                    ),
+                )
+            except StopAsyncIteration:
+                break
             if not isinstance(chunk, dict):
                 continue
+            fallback_count += 1
             chunk_type = chunk.get("type")
+            last_fallback_type = str(chunk_type)
             ns = _namespace_tuple(chunk.get("ns"))
+            if fallback_count <= 5 or fallback_count % 50 == 0:
+                logger.info(
+                    "[%s] _stream_llm_chunks: fallback chunk type=%s ns=%s count=%d at %.3fs",
+                    request_id,
+                    chunk_type,
+                    ns,
+                    fallback_count,
+                    time.monotonic() - started,
+                )
 
             if chunk_type == "updates" and _STREAM_PROGRESS_UPDATES:
                 if _is_subagent_namespace(ns):
                     continue
                 progress = _progress_from_update(chunk)
                 if progress:
+                    fallback_emitted += 1
                     yield "reasoning", progress
                 continue
 
@@ -697,12 +998,29 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
             token = payload[0]
             text = _message_token_text(token)
             if text:
+                fallback_emitted += 1
+                if fallback_emitted <= 5:
+                    logger.info(
+                        "[%s] _stream_llm_chunks: emitting content chars=%d via fallback at %.3fs",
+                        request_id,
+                        len(text),
+                        time.monotonic() - started,
+                    )
                 yield "content", text
+        logger.info(
+            "[%s] _stream_llm_chunks: fallback astream completed chunks=%d emitted=%d at %.3fs",
+            request_id,
+            fallback_count,
+            fallback_emitted,
+            time.monotonic() - started,
+        )
 
     async def _stream(chat_request_or_message: ChatRequestOrMessage) -> AsyncGenerator[ChatResponseChunk, None]:
         """OpenAI-style SSE chunks via NAT ``ChatResponseChunk`` (``data:`` lines when framed by NAT)."""
+        request_id = uuid.uuid4().hex[:8]
+        started = time.monotonic()
         chat_request = GlobalTypeConverter.get().convert(chat_request_or_message, to_type=ChatRequest)
-        logging.info("In _stream: Received chat request: %s", chat_request_or_message)
+        logging.info("[%s] _stream received chat request: %s", request_id, chat_request_or_message)
         response_model = _response_model(chat_request)
         stream_id = str(uuid.uuid4())
         created = datetime.datetime.now(datetime.UTC)
@@ -714,16 +1032,30 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
             max_chars=_STREAM_MAX_SEGMENT_CHARS,
         )
 
+        yield ChatResponseChunk.create_streaming_chunk(
+            "",
+            id_=stream_id,
+            created=created,
+            model=response_model,
+            role=UserMessageContentRoleType.ASSISTANT,
+        )
+        logging.info("[%s] _stream yielded initial empty chunk before agent session at %.3fs", request_id, time.monotonic() - started)
+
         async with _agent_session(chat_request) as (agent, messages):
-            yield ChatResponseChunk.create_streaming_chunk(
-                "",
-                id_=stream_id,
-                created=created,
-                model=response_model,
-                role=UserMessageContentRoleType.ASSISTANT,
-            )
+            logging.info("[%s] _stream agent session ready at %.3fs", request_id, time.monotonic() - started)
             try:
-                async for kind, text in _stream_llm_chunks(agent, messages):
+                chunk_count = 0
+                async for kind, text in _stream_llm_chunks(agent, messages, request_id=request_id):
+                    chunk_count += 1
+                    if chunk_count <= 5:
+                        logging.info(
+                            "[%s] _stream consumed stream chunk %d kind=%s chars=%d at %.3fs",
+                            request_id,
+                            chunk_count,
+                            kind,
+                            len(text),
+                            time.monotonic() - started,
+                        )
                     if kind == "content":
                         assembled_raw.append(text)
                         for chunk in writer.feed(text):
@@ -731,8 +1063,9 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
                     else:
                         for chunk in writer.feed_kind("reasoning", text):
                             yield chunk
+                logging.info("[%s] _stream completed token stream chunks=%d at %.3fs", request_id, chunk_count, time.monotonic() - started)
             except Exception:
-                logger.exception("Token streaming failed; falling back to buffered completion")
+                logger.exception("[%s] Token streaming failed; falling back to buffered completion", request_id)
                 agent_result = await agent.ainvoke({"messages": messages})
                 result_messages = agent_result["messages"]
                 content = result_messages[-1].content if result_messages else ""
@@ -746,8 +1079,10 @@ async def deep_agent(config: DeepAgentConfig, builder: Builder):
                 yield chunk
 
             content = strip_pattern("".join(assembled_raw), strip_re)
+            logging.info("[%s] _stream final content_chars=%d at %.3fs", request_id, len(content), time.monotonic() - started)
 
         usage = _usage_for_content(chat_request, content)
+        logging.info("[%s] _stream yielding final stop chunk at %.3fs", request_id, time.monotonic() - started)
         yield ChatResponseChunk.create_streaming_chunk(
             "",
             id_=stream_id,
